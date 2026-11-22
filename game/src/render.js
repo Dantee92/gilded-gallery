@@ -1,11 +1,12 @@
-// Drawing only: the world's state and the current screen in, pixels out. The 1280x720
-// playfield is scaled to fit the window and centred, the margin filled with the
-// backdrop colour. Torch cones are drawn additively so overlapping light brightens,
-// like real lamplight; camera cones are red. Text that holds a number is rebuilt
-// only when it changes.
+// The painter: everything the player sees, and nothing the game rules know about.
+// The playfield is a fixed 1280x720 logical area (32 by 18 tiles of 40 px); the
+// canvas is scaled to fit the window, so one frame always shows the whole room:
+// marble floor, gold-trimmed walls, glass cases, statues, velvet alcoves, the
+// guards' torch cones, the cameras' red cones, the thief, the Star Sapphire, the
+// roof door, the alarm meter and the HUD — plus the title, pause, clear, caught
+// and win panels. All colours come from config.js.
 
-import { ALARM, CAMERA, FIELD, FONT, GUARD, LIVES, PALETTE, SMOKE, TILE } from './config.js';
-import { isVelvet, isWall } from './level.js';
+import { ALARM, COLS, FIELD, FONT, GUARD, CAMERA, PALETTE, ROWS, TILE } from './config.js';
 
 export const SCREEN_TITLE = 'title';
 export const SCREEN_PLAY = 'play';
@@ -14,483 +15,653 @@ export const SCREEN_CLEAR = 'clear';
 export const SCREEN_OVER = 'over';
 export const SCREEN_WIN = 'win';
 
-const PANEL = { width: 680, top: 150, line: 34, bottom: 76 };
-const LIFE_SIZE = 18;
-const LIFE_GAP = 8;
+/** A wedge of light: a filled sector centred on (x, y), facing `angle`. */
+function wedge(ctx, x, y, range, angle, halfAngle) {
+  ctx.beginPath();
+  ctx.moveTo(x, y);
+  ctx.arc(x, y, range, angle - halfAngle, angle + halfAngle);
+  ctx.closePath();
+}
 
-function cachedLabel(prefix) {
-  let value = null;
-  let text = '';
-  return function label(next) {
-    if (next !== value) {
-      value = next;
-      text = prefix + next;
-    }
-    return text;
-  };
+/** The two straight rims of a wedge, stroked so the cone's edge reads clearly. */
+function wedgeRims(ctx, x, y, range, angle, halfAngle) {
+  ctx.beginPath();
+  ctx.moveTo(x, y);
+  ctx.lineTo(x + Math.cos(angle - halfAngle) * range, y + Math.sin(angle - halfAngle) * range);
+  ctx.moveTo(x, y);
+  ctx.lineTo(x + Math.cos(angle + halfAngle) * range, y + Math.sin(angle + halfAngle) * range);
+  ctx.stroke();
+}
+
+function roundRect(ctx, x, y, w, h, r) {
+  ctx.beginPath();
+  ctx.moveTo(x + r, y);
+  ctx.arcTo(x + w, y, x + w, y + h, r);
+  ctx.arcTo(x + w, y + h, x, y + h, r);
+  ctx.arcTo(x, y + h, x, y, r);
+  ctx.arcTo(x, y, x + w, y, r);
+  ctx.closePath();
+}
+
+function fmtTime(seconds) {
+  const total = Math.max(0, Math.floor(seconds));
+  const m = Math.floor(total / 60);
+  const s = total % 60;
+  return `${m}:${s < 10 ? '0' : ''}${s}`;
 }
 
 export function createRenderer(canvas) {
-  const context = canvas.getContext('2d');
-  const view = { scale: 1, x: 0, y: 0 };
-  const scoreLabel = cachedLabel('Score ');
-  const levelLabel = cachedLabel('');
-  const timeLabel = cachedLabel('');
-  const finalLabel = cachedLabel('Score ');
-  const bestLabel = cachedLabel('Best ');
-  const smokeLabel = cachedLabel('Smoke ');
+  const ctx = canvas.getContext('2d');
 
-  function resize() {
-    const ratio = window.devicePixelRatio || 1;
-    const width = Math.round(window.innerWidth * ratio);
-    const height = Math.round(window.innerHeight * ratio);
-    canvas.width = width;
-    canvas.height = height;
-    view.scale = Math.min(width / FIELD.width, height / FIELD.height);
-    view.x = (width - FIELD.width * view.scale) / 2;
-    view.y = (height - FIELD.height * view.scale) / 2;
+  /** Fit the 1280x720 field into the canvas, letterboxed and centred. */
+  function frame() {
+    const dpr = window.devicePixelRatio || 1;
+    const cssW = Math.max(1, canvas.clientWidth);
+    const cssH = Math.max(1, canvas.clientHeight);
+    const pxW = Math.round(cssW * dpr);
+    const pxH = Math.round(cssH * dpr);
+    if (canvas.width !== pxW || canvas.height !== pxH) {
+      canvas.width = pxW;
+      canvas.height = pxH;
+    }
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.fillStyle = PALETTE.backdrop;
+    ctx.fillRect(0, 0, cssW, cssH);
+    const scale = Math.min(cssW / FIELD.width, cssH / FIELD.height);
+    const ox = (cssW - FIELD.width * scale) / 2;
+    const oy = (cssH - FIELD.height * scale) / 2;
+    ctx.save();
+    ctx.translate(ox, oy);
+    ctx.scale(scale, scale);
   }
 
-  const fonts = new Map();
-  function text(value, x, y, size, color, align) {
-    if (!fonts.has(size)) fonts.set(size, `${size}px ${FONT}`);
-    context.font = fonts.get(size);
-    context.fillStyle = color;
-    context.textAlign = align;
-    context.textBaseline = 'alphabetic';
-    context.fillText(value, x, y);
-  }
-
-  function drawTiles(state) {
-    const grid = state.grid;
-    for (let ty = 0; ty < 18; ty += 1) {
-      for (let tx = 0; tx < 32; tx += 1) {
-        const x = tx * TILE;
-        const y = ty * TILE;
+  /** Marble checkerboard floor with a faint grout line between tiles. */
+  function paintFloor(grid) {
+    for (let ty = 0; ty < ROWS; ty += 1) {
+      for (let tx = 0; tx < COLS; tx += 1) {
         const ch = grid[ty][tx];
-        if (ch === '#') {
-          context.fillStyle = PALETTE.wall;
-          context.fillRect(x, y, TILE, TILE);
-          context.fillStyle = PALETTE.wallTop;
-          context.fillRect(x, y, TILE, 4);
-          context.fillStyle = 'rgba(0,0,0,0.25)';
-          context.fillRect(x, y + TILE - 4, TILE, 4);
-        } else if (ch === 'D') {
-          // A glass display case: dark glass, gold frame, a pale glint.
-          context.fillStyle = (tx + ty) % 2 === 0 ? PALETTE.floor : PALETTE.floorAlt;
-          context.fillRect(x, y, TILE, TILE);
-          context.fillStyle = PALETTE.caseGlass;
-          context.fillRect(x + 4, y + 4, TILE - 8, TILE - 8);
-          context.strokeStyle = PALETTE.caseFrame;
-          context.lineWidth = 2;
-          context.strokeRect(x + 4, y + 4, TILE - 8, TILE - 8);
-          context.fillStyle = PALETTE.caseGlint;
-          context.beginPath();
-          context.moveTo(x + 9, y + 30);
-          context.lineTo(x + 16, y + 9);
-          context.lineTo(x + 21, y + 9);
-          context.lineTo(x + 14, y + 30);
-          context.closePath();
-          context.fill();
-        } else if (ch === 'S') {
-          // A marble statue on its plinth.
-          context.fillStyle = (tx + ty) % 2 === 0 ? PALETTE.floor : PALETTE.floorAlt;
-          context.fillRect(x, y, TILE, TILE);
-          context.fillStyle = PALETTE.statueBase;
-          context.fillRect(x + 8, y + 26, TILE - 16, 10);
-          context.fillStyle = PALETTE.statue;
-          context.beginPath();
-          context.arc(x + 20, y + 14, 7, 0, Math.PI * 2);
-          context.fill();
-          context.fillRect(x + 15, y + 18, 10, 9);
-        } else {
-          context.fillStyle = (tx + ty) % 2 === 0 ? PALETTE.floor : PALETTE.floorAlt;
-          context.fillRect(x, y, TILE, TILE);
-          // Marble veining: a faint gold grout line along the bottom edge.
-          context.fillStyle = PALETTE.floorEdge;
-          context.fillRect(x, y + TILE - 1, TILE, 1);
-          if (ch === 'V') {
-            // A velvet shadow alcove: deep maroon drapes, a place to vanish.
-            context.fillStyle = PALETTE.velvetDark;
-            context.beginPath();
-            context.arc(x + 14, y + 22, 13, 0, Math.PI * 2);
-            context.arc(x + 27, y + 16, 11, 0, Math.PI * 2);
-            context.arc(x + 22, y + 30, 10, 0, Math.PI * 2);
-            context.fill();
-            context.fillStyle = PALETTE.velvet;
-            context.beginPath();
-            context.arc(x + 13, y + 20, 10, 0, Math.PI * 2);
-            context.arc(x + 26, y + 15, 9, 0, Math.PI * 2);
-            context.arc(x + 21, y + 28, 8, 0, Math.PI * 2);
-            context.fill();
-            context.fillStyle = PALETTE.velvetFold;
-            context.beginPath();
-            context.arc(x + 12, y + 18, 4, 0, Math.PI * 2);
-            context.arc(x + 25, y + 13, 3, 0, Math.PI * 2);
-            context.arc(x + 20, y + 26, 3, 0, Math.PI * 2);
-            context.fill();
-          }
-        }
+        if (ch === '#') continue;
+        ctx.fillStyle = (tx + ty) % 2 === 0 ? PALETTE.floor : PALETTE.floorAlt;
+        ctx.fillRect(tx * TILE, ty * TILE, TILE, TILE);
+        ctx.strokeStyle = PALETTE.floorEdge;
+        ctx.lineWidth = 1;
+        ctx.strokeRect(tx * TILE + 0.5, ty * TILE + 0.5, TILE - 1, TILE - 1);
       }
     }
   }
 
-  function drawExit(state) {
-    const exit = state.exit;
-    const open = exit.open;
-    context.save();
-    context.translate(exit.x, exit.y);
-    context.fillStyle = open ? PALETTE.exit : PALETTE.exitDim;
-    context.fillRect(-16, -18, 32, 36);
-    context.fillStyle = '#101623';
-    context.fillRect(-11, -13, 22, 26);
-    context.strokeStyle = open ? PALETTE.exit : PALETTE.exitDim;
-    context.lineWidth = 2;
-    context.beginPath();
-    context.moveTo(-11, -13);
-    context.lineTo(11, -13);
-    context.moveTo(-11, 0);
-    context.lineTo(11, 0);
-    context.moveTo(-11, 13);
-    context.lineTo(11, 13);
-    context.stroke();
-    if (open) {
-      context.globalCompositeOperation = 'lighter';
-      const glow = context.createRadialGradient(0, 0, 4, 0, 0, 46);
+  /** Walls: dark navy blocks with a gold lip on the edge facing the room. */
+  function paintWalls(grid) {
+    for (let ty = 0; ty < ROWS; ty += 1) {
+      for (let tx = 0; tx < COLS; tx += 1) {
+        if (grid[ty][tx] !== '#') continue;
+        ctx.fillStyle = PALETTE.wall;
+        ctx.fillRect(tx * TILE, ty * TILE, TILE, TILE);
+        // The gold trim runs along the side that borders open floor.
+        const below = ty + 1 < ROWS ? grid[ty + 1][tx] : '#';
+        const above = ty - 1 >= 0 ? grid[ty - 1][tx] : '#';
+        const right = tx + 1 < COLS ? grid[ty][tx + 1] : '#';
+        const left = tx - 1 >= 0 ? grid[ty][tx - 1] : '#';
+        ctx.fillStyle = PALETTE.wallTop;
+        if (below !== '#') ctx.fillRect(tx * TILE, ty * TILE + TILE - 3, TILE, 3);
+        if (above !== '#') ctx.fillRect(tx * TILE, ty * TILE, TILE, 3);
+        if (right !== '#') ctx.fillRect(tx * TILE + TILE - 3, ty * TILE, 3, TILE);
+        if (left !== '#') ctx.fillRect(tx * TILE, ty * TILE, 3, TILE);
+      }
+    }
+  }
+
+  /** A glass display case: gold frame, blue-grey glass, a glint across it. */
+  function paintCase(x, y) {
+    const px = x * TILE;
+    const py = y * TILE;
+    ctx.fillStyle = PALETTE.caseFrame;
+    ctx.fillRect(px + 2, py + 2, TILE - 4, TILE - 4);
+    ctx.fillStyle = PALETTE.caseGlass;
+    ctx.fillRect(px + 5, py + 5, TILE - 10, TILE - 10);
+    ctx.strokeStyle = PALETTE.caseGlint;
+    ctx.lineWidth = 2;
+    ctx.globalAlpha = 0.7;
+    ctx.beginPath();
+    ctx.moveTo(px + 9, py + TILE - 9);
+    ctx.lineTo(px + TILE - 9, py + 9);
+    ctx.stroke();
+    ctx.globalAlpha = 1;
+    ctx.fillStyle = PALETTE.sapphire;
+    ctx.globalAlpha = 0.55;
+    ctx.beginPath();
+    ctx.arc(px + TILE / 2, py + TILE / 2, 4, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.globalAlpha = 1;
+  }
+
+  /** A marble statue: dark plinth with a pale bust on top. */
+  function paintStatue(x, y) {
+    const px = x * TILE;
+    const py = y * TILE;
+    ctx.fillStyle = PALETTE.statueBase;
+    roundRect(ctx, px + 5, py + TILE - 12, TILE - 10, 9, 2);
+    ctx.fill();
+    ctx.fillStyle = PALETTE.statue;
+    // Shoulders and head of the bust.
+    ctx.beginPath();
+    ctx.arc(px + TILE / 2, py + 14, 7, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.beginPath();
+    ctx.moveTo(px + 9, py + TILE - 10);
+    ctx.quadraticCurveTo(px + TILE / 2, py + 16, px + TILE - 9, py + TILE - 10);
+    ctx.closePath();
+    ctx.fill();
+  }
+
+  /** A velvet shadow alcove: deep maroon drape with fold lines, a place to hide. */
+  function paintVelvet(x, y) {
+    const px = x * TILE;
+    const py = y * TILE;
+    ctx.fillStyle = PALETTE.velvetDark;
+    roundRect(ctx, px + 2, py + 2, TILE - 4, TILE - 4, 6);
+    ctx.fill();
+    ctx.fillStyle = PALETTE.velvet;
+    roundRect(ctx, px + 5, py + 5, TILE - 10, TILE - 10, 5);
+    ctx.fill();
+    ctx.strokeStyle = PALETTE.velvetFold;
+    ctx.lineWidth = 2;
+    for (let i = 0; i < 3; i += 1) {
+      const fx = px + 11 + i * 9;
+      ctx.beginPath();
+      ctx.moveTo(fx, py + 7);
+      ctx.quadraticCurveTo(fx + 3, py + TILE / 2, fx, py + TILE - 7);
+      ctx.stroke();
+    }
+  }
+
+  function paintFurniture(grid) {
+    for (let ty = 0; ty < ROWS; ty += 1) {
+      for (let tx = 0; tx < COLS; tx += 1) {
+        const ch = grid[ty][tx];
+        if (ch === 'D') paintCase(tx, ty);
+        else if (ch === 'S') paintStatue(tx, ty);
+        else if (ch === 'V') paintVelvet(tx, ty);
+      }
+    }
+  }
+
+  /** The roof door: a gold frame; open means lit and glowing, closed means dim. */
+  function paintExit(exit) {
+    const x = exit.x;
+    const y = exit.y;
+    if (exit.open) {
+      const glow = ctx.createRadialGradient(x, y, 4, x, y, 46);
       glow.addColorStop(0, 'rgba(201, 162, 39, 0.55)');
       glow.addColorStop(1, 'rgba(201, 162, 39, 0)');
-      context.fillStyle = glow;
-      context.beginPath();
-      context.arc(0, 0, 46, 0, Math.PI * 2);
-      context.fill();
-      context.globalCompositeOperation = 'source-over';
+      ctx.fillStyle = glow;
+      ctx.beginPath();
+      ctx.arc(x, y, 46, 0, Math.PI * 2);
+      ctx.fill();
+      // A gold chevron above the open door points the way out.
+      ctx.fillStyle = PALETTE.exit;
+      ctx.beginPath();
+      ctx.moveTo(x, y - 26);
+      ctx.lineTo(x + 8, y - 36);
+      ctx.lineTo(x - 8, y - 36);
+      ctx.closePath();
+      ctx.fill();
     }
-    context.restore();
+    ctx.fillStyle = exit.open ? PALETTE.exit : PALETTE.exitDim;
+    roundRect(ctx, x - 15, y - 17, 30, 34, 4);
+    ctx.fill();
+    ctx.fillStyle = PALETTE.backdrop;
+    ctx.fillRect(x - 10, y - 12, 20, 24);
+    ctx.strokeStyle = exit.open ? PALETTE.exit : PALETTE.exitDim;
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.moveTo(x, y - 12);
+    ctx.lineTo(x, y + 12);
+    ctx.stroke();
+    if (!exit.open) {
+      ctx.fillStyle = PALETTE.exitDim;
+      ctx.beginPath();
+      ctx.arc(x, y, 3, 0, Math.PI * 2);
+      ctx.fill();
+    }
   }
 
-  function drawSapphire(state) {
-    if (state.sapphire.taken) return;
-    const gem = state.sapphire;
-    const t = Date.now() / 1000;
-    const pulse = 0.75 + Math.sin(t * 2.4) * 0.25;
-    context.save();
-    context.translate(gem.x, gem.y);
-    context.globalCompositeOperation = 'lighter';
-    const glow = context.createRadialGradient(0, 0, 2, 0, 0, 46 * pulse);
-    glow.addColorStop(0, 'rgba(77, 184, 255, 0.6)');
-    glow.addColorStop(1, 'rgba(77, 184, 255, 0)');
-    context.fillStyle = glow;
-    context.beginPath();
-    context.arc(0, 0, 46 * pulse, 0, Math.PI * 2);
-    context.fill();
-    context.globalCompositeOperation = 'source-over';
-    // A faceted star sapphire: a diamond with a bright core.
-    context.fillStyle = PALETTE.sapphire;
-    context.beginPath();
-    context.moveTo(0, -14);
-    context.lineTo(10, 0);
-    context.lineTo(0, 14);
-    context.lineTo(-10, 0);
-    context.closePath();
-    context.fill();
-    context.fillStyle = PALETTE.sapphireCore;
-    context.beginPath();
-    context.moveTo(0, -6);
-    context.lineTo(5, 0);
-    context.lineTo(0, 6);
-    context.lineTo(-5, 0);
-    context.closePath();
-    context.fill();
-    context.restore();
+  /** The Star Sapphire: a faceted blue diamond with a bright core and sparkles. */
+  function paintSapphire(sapphire) {
+    if (sapphire.taken) return;
+    const x = sapphire.x;
+    const y = sapphire.y;
+    const halo = ctx.createRadialGradient(x, y, 2, x, y, 34);
+    halo.addColorStop(0, 'rgba(77, 184, 255, 0.5)');
+    halo.addColorStop(1, 'rgba(77, 184, 255, 0)');
+    ctx.fillStyle = halo;
+    ctx.beginPath();
+    ctx.arc(x, y, 34, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.fillStyle = PALETTE.sapphire;
+    ctx.beginPath();
+    ctx.moveTo(x, y - 14);
+    ctx.lineTo(x + 11, y);
+    ctx.lineTo(x, y + 14);
+    ctx.lineTo(x - 11, y);
+    ctx.closePath();
+    ctx.fill();
+    ctx.fillStyle = PALETTE.sapphireCore;
+    ctx.beginPath();
+    ctx.moveTo(x, y - 7);
+    ctx.lineTo(x + 5, y);
+    ctx.lineTo(x, y + 7);
+    ctx.lineTo(x - 5, y);
+    ctx.closePath();
+    ctx.fill();
+    ctx.strokeStyle = PALETTE.sapphireCore;
+    ctx.lineWidth = 1.5;
+    ctx.beginPath();
+    ctx.moveTo(x - 18, y - 10);
+    ctx.lineTo(x - 12, y - 10);
+    ctx.moveTo(x - 15, y - 13);
+    ctx.lineTo(x - 15, y - 7);
+    ctx.moveTo(x + 14, y + 12);
+    ctx.lineTo(x + 19, y + 12);
+    ctx.moveTo(x + 16, y + 9);
+    ctx.lineTo(x + 16, y + 15);
+    ctx.stroke();
   }
 
-  function drawGuardCone(guard) {
-    const range = GUARD.range;
-    const half = GUARD.halfAngle;
-    context.save();
-    context.globalCompositeOperation = 'lighter';
-    const hot = guard.state === 'alerted';
-    const grad = context.createRadialGradient(guard.x, guard.y, 10, guard.x, guard.y, range);
-    grad.addColorStop(0, hot ? 'rgba(255, 84, 64, 0.5)' : 'rgba(255, 202, 106, 0.4)');
-    grad.addColorStop(1, 'rgba(255, 202, 106, 0)');
-    context.fillStyle = grad;
-    context.beginPath();
-    context.moveTo(guard.x, guard.y);
-    context.arc(guard.x, guard.y, range, guard.angle - half, guard.angle + half);
-    context.closePath();
-    context.fill();
-    context.globalCompositeOperation = 'source-over';
-    context.fillStyle = hot ? PALETTE.coneAlert : PALETTE.cone;
-    context.beginPath();
-    context.moveTo(guard.x, guard.y);
-    context.arc(guard.x, guard.y, range, guard.angle - half, guard.angle + half);
-    context.closePath();
-    context.fill();
-    context.restore();
+  /** Smoke clouds: soft grey puffs that fade as their timer runs out. */
+  function paintClouds(clouds) {
+    for (const cloud of clouds) {
+      const alpha = Math.min(1, cloud.t / 1.5);
+      ctx.fillStyle = PALETTE.smoke;
+      ctx.globalAlpha = 0.35 * alpha;
+      ctx.beginPath();
+      ctx.arc(cloud.x, cloud.y, cloud.r, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.globalAlpha = 0.5 * alpha;
+      ctx.beginPath();
+      ctx.arc(cloud.x - cloud.r * 0.25, cloud.y - cloud.r * 0.2, cloud.r * 0.55, 0, Math.PI * 2);
+      ctx.arc(cloud.x + cloud.r * 0.3, cloud.y + cloud.r * 0.15, cloud.r * 0.45, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.globalAlpha = 1;
+    }
   }
 
-  function drawGuard(guard) {
-    drawGuardCone(guard);
-    context.save();
-    context.translate(guard.x, guard.y);
-    // Torchlight around the guard.
-    context.globalCompositeOperation = 'lighter';
-    const glow = context.createRadialGradient(0, 0, 2, 0, 0, 34);
-    glow.addColorStop(0, 'rgba(255, 202, 106, 0.5)');
-    glow.addColorStop(1, 'rgba(255, 202, 106, 0)');
-    context.fillStyle = glow;
-    context.beginPath();
-    context.arc(0, 0, 34, 0, Math.PI * 2);
-    context.fill();
-    context.globalCompositeOperation = 'source-over';
-    // Body: coat, head, cap, torch in hand.
-    context.rotate(guard.angle);
-    context.fillStyle = PALETTE.guardCoat;
-    context.beginPath();
-    context.arc(0, 0, 12, 0, Math.PI * 2);
-    context.fill();
-    context.fillStyle = PALETTE.guard;
-    context.beginPath();
-    context.arc(4, 0, 6, 0, Math.PI * 2);
-    context.fill();
-    context.fillStyle = PALETTE.torch;
-    context.beginPath();
-    context.arc(14, 6, 4, 0, Math.PI * 2);
-    context.fill();
-    context.restore();
-    // Alert marker above an alerted or suspicious guard.
+  /** A guard's torch cone: warm gold, turning red as the guard grows suspicious. */
+  function paintGuardCone(guard) {
+    const hot = guard.alert > 0.35;
+    const alerted = guard.state === 'alerted';
+    const fill = alerted ? PALETTE.coneAlert : hot ? PALETTE.coneHot : PALETTE.cone;
+    ctx.fillStyle = fill;
+    wedge(ctx, guard.x, guard.y, GUARD.range, guard.angle, GUARD.halfAngle);
+    ctx.fill();
+    ctx.strokeStyle = alerted ? 'rgba(255, 84, 64, 0.5)' : 'rgba(255, 202, 106, 0.35)';
+    ctx.lineWidth = 1.5;
+    wedgeRims(ctx, guard.x, guard.y, GUARD.range, guard.angle, GUARD.halfAngle);
+  }
+
+  /** A camera's sweeping cone: red, brighter while it has the thief in sight. */
+  function paintCameraCone(camera) {
+    ctx.fillStyle = camera.spotted ? PALETTE.cameraConeHot : PALETTE.cameraCone;
+    wedge(ctx, camera.x, camera.y, CAMERA.range, camera.angle, CAMERA.halfAngle);
+    ctx.fill();
+    ctx.strokeStyle = camera.spotted ? 'rgba(255, 59, 48, 0.6)' : 'rgba(255, 59, 48, 0.35)';
+    ctx.lineWidth = 1.5;
+    wedgeRims(ctx, camera.x, camera.y, CAMERA.range, camera.angle, CAMERA.halfAngle);
+  }
+
+  /** A guard: dark coat, pale face, torch flame toward where he looks, alert ring. */
+  function paintGuard(guard) {
+    const x = guard.x;
+    const y = guard.y;
+    const fx = Math.cos(guard.angle);
+    const fy = Math.sin(guard.angle);
+    // Torch flame, held out in front.
+    ctx.fillStyle = PALETTE.torch;
+    ctx.beginPath();
+    ctx.arc(x + fx * 17, y + fy * 17, 5, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.fillStyle = 'rgba(255, 202, 106, 0.35)';
+    ctx.beginPath();
+    ctx.arc(x + fx * 17, y + fy * 17, 9, 0, Math.PI * 2);
+    ctx.fill();
+    // Coat and shoulders.
+    ctx.fillStyle = PALETTE.guardCoat;
+    ctx.beginPath();
+    ctx.arc(x, y, guard.radius, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.fillStyle = PALETTE.guard;
+    ctx.beginPath();
+    ctx.arc(x, y, guard.radius - 4, 0, Math.PI * 2);
+    ctx.fill();
+    // Face, turned toward the facing direction.
+    ctx.fillStyle = PALETTE.playerFace;
+    ctx.beginPath();
+    ctx.arc(x + fx * 4, y + fy * 4, 5, 0, Math.PI * 2);
+    ctx.fill();
+    // Detection ring: fills as the guard's meter fills.
+    if (guard.alert > 0.02) {
+      ctx.strokeStyle = guard.alert >= 1 ? PALETTE.bad : PALETTE.warn;
+      ctx.lineWidth = 3;
+      ctx.beginPath();
+      ctx.arc(x, y, guard.radius + 6, -Math.PI / 2, -Math.PI / 2 + guard.alert * Math.PI * 2);
+      ctx.stroke();
+    }
+    // Alerted: a red mark above the head; suspicious or investigating: a question.
     if (guard.state === 'alerted') {
-      text('!', guard.x, guard.y - 22, 26, PALETTE.bad, 'center');
+      ctx.fillStyle = PALETTE.bad;
+      ctx.font = `bold 20px ${FONT}`;
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+      ctx.fillText('!', x, y - guard.radius - 12);
     } else if (guard.state === 'suspicious' || guard.state === 'investigate') {
-      text('?', guard.x, guard.y - 22, 24, PALETTE.warn, 'center');
+      ctx.fillStyle = PALETTE.warn;
+      ctx.font = `bold 18px ${FONT}`;
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+      ctx.fillText('?', x, y - guard.radius - 12);
     }
   }
 
-  function drawCameraCone(camera) {
-    const range = CAMERA.range;
-    const half = CAMERA.halfAngle;
-    context.save();
-    context.globalCompositeOperation = 'lighter';
-    const grad = context.createRadialGradient(camera.x, camera.y, 10, camera.x, camera.y, range);
-    grad.addColorStop(0, camera.spotted ? 'rgba(255, 59, 48, 0.55)' : 'rgba(255, 59, 48, 0.35)');
-    grad.addColorStop(1, 'rgba(255, 59, 48, 0)');
-    context.fillStyle = grad;
-    context.beginPath();
-    context.moveTo(camera.x, camera.y);
-    context.arc(camera.x, camera.y, range, camera.angle - half, camera.angle + half);
-    context.closePath();
-    context.fill();
-    context.globalCompositeOperation = 'source-over';
-    context.fillStyle = camera.spotted ? PALETTE.cameraConeHot : PALETTE.cameraCone;
-    context.beginPath();
-    context.moveTo(camera.x, camera.y);
-    context.arc(camera.x, camera.y, range, camera.angle - half, camera.angle + half);
-    context.closePath();
-    context.fill();
-    context.restore();
-  }
-
-  function drawCamera(camera) {
-    drawCameraCone(camera);
-    context.save();
-    context.translate(camera.x, camera.y);
-    // Wall-mounted unit: dark box, red lens, blinking when it has the thief.
-    context.rotate(camera.angle);
-    context.fillStyle = PALETTE.cameraBody;
-    context.fillRect(-8, -6, 16, 12);
-    context.fillStyle = camera.spotted ? '#ff8a80' : PALETTE.cameraLens;
-    context.beginPath();
-    context.arc(8, 0, 4, 0, Math.PI * 2);
-    context.fill();
-    context.restore();
+  /** A wall camera: dark housing, red lens, a small bracket to the wall. */
+  function paintCamera(camera) {
+    const x = camera.x;
+    const y = camera.y;
+    ctx.strokeStyle = PALETTE.cameraBody;
+    ctx.lineWidth = 3;
+    ctx.beginPath();
+    ctx.moveTo(x, y);
+    ctx.lineTo(x - Math.cos(camera.base) * 12, y - Math.sin(camera.base) * 12);
+    ctx.stroke();
+    ctx.fillStyle = PALETTE.cameraBody;
+    roundRect(ctx, x - 8, y - 8, 16, 16, 4);
+    ctx.fill();
+    ctx.fillStyle = PALETTE.cameraLens;
+    ctx.beginPath();
+    ctx.arc(x + Math.cos(camera.angle) * 4, y + Math.sin(camera.angle) * 4, 4, 0, Math.PI * 2);
+    ctx.fill();
     if (camera.spotted) {
-      text('!', camera.x, camera.y - 20, 24, PALETTE.bad, 'center');
+      ctx.strokeStyle = PALETTE.cameraLens;
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      ctx.arc(x, y, 13, 0, Math.PI * 2);
+      ctx.stroke();
     }
   }
 
-  function drawSmoke(state) {
-    for (const cloud of state.alarm.clouds) {
-      const fade = Math.min(1, cloud.t / 1.5);
-      context.save();
-      context.globalAlpha = 0.4 * fade;
-      context.fillStyle = PALETTE.smoke;
-      context.beginPath();
-      context.arc(cloud.x - 28, cloud.y + 8, 34, 0, Math.PI * 2);
-      context.arc(cloud.x + 22, cloud.y - 12, 38, 0, Math.PI * 2);
-      context.arc(cloud.x + 6, cloud.y + 22, 30, 0, Math.PI * 2);
-      context.fill();
-      context.restore();
+  /** The thief: a hooded figure, crouched lower while sneaking. */
+  function paintThief(player, grid) {
+    const x = player.x;
+    const y = player.y;
+    const tileRow = grid[Math.floor(y / TILE)];
+    const inVelvet = tileRow && tileRow[Math.floor(x / TILE)] === 'V';
+    const r = player.sneaking ? player.radius - 2 : player.radius;
+    // A soft shadow under the thief.
+    ctx.fillStyle = 'rgba(0, 0, 0, 0.35)';
+    ctx.beginPath();
+    ctx.ellipse(x, y + r * 0.8, r * 0.9, r * 0.35, 0, 0, Math.PI * 2);
+    ctx.fill();
+    // Cloak.
+    ctx.fillStyle = PALETTE.playerCloak;
+    ctx.beginPath();
+    ctx.arc(x, y, r, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.fillStyle = PALETTE.player;
+    ctx.beginPath();
+    ctx.arc(x, y, r - 4, 0, Math.PI * 2);
+    ctx.fill();
+    // Hood point and face, turned toward the facing direction.
+    const fx = Math.cos(player.face);
+    const fy = Math.sin(player.face);
+    ctx.fillStyle = PALETTE.playerCloak;
+    ctx.beginPath();
+    ctx.moveTo(x + fx * (r + 2), y + fy * (r + 2));
+    ctx.lineTo(x - fy * 5, y + fx * 5);
+    ctx.lineTo(x + fy * 5, y - fx * 5);
+    ctx.closePath();
+    ctx.fill();
+    ctx.fillStyle = PALETTE.playerFace;
+    ctx.beginPath();
+    ctx.arc(x + fx * 3, y + fy * 3, 4.5, 0, Math.PI * 2);
+    ctx.fill();
+    // Hidden in velvet: a faint maroon shimmer says the eyes cannot find you.
+    if (inVelvet) {
+      ctx.strokeStyle = 'rgba(107, 26, 46, 0.9)';
+      ctx.lineWidth = 2;
+      ctx.setLineDash([4, 4]);
+      ctx.beginPath();
+      ctx.arc(x, y, r + 5, 0, Math.PI * 2);
+      ctx.stroke();
+      ctx.setLineDash([]);
     }
   }
 
-  function drawPlayer(state) {
-    const player = state.player;
-    const hidden = isVelvet(state.grid, Math.floor(player.x / TILE), Math.floor(player.y / TILE));
-    context.save();
-    context.translate(player.x, player.y);
-    // Moonlight pool around the thief.
-    context.globalCompositeOperation = 'lighter';
-    const glow = context.createRadialGradient(0, 0, 2, 0, 0, 40);
-    glow.addColorStop(0, 'rgba(207, 228, 255, 0.20)');
-    glow.addColorStop(1, 'rgba(207, 228, 255, 0)');
-    context.fillStyle = glow;
-    context.beginPath();
-    context.arc(0, 0, 40, 0, Math.PI * 2);
-    context.fill();
-    context.globalCompositeOperation = 'source-over';
-    context.globalAlpha = hidden ? 0.45 : 1;
-    context.rotate(player.face || 0);
-    // Hooded cloak, drawn smaller while sneaking.
-    const s = player.sneaking ? 0.85 : 1;
-    context.scale(s, s);
-    context.fillStyle = PALETTE.playerCloak;
-    context.beginPath();
-    context.moveTo(14, 0);
-    context.lineTo(-8, -10);
-    context.lineTo(-12, 0);
-    context.lineTo(-8, 10);
-    context.closePath();
-    context.fill();
-    context.fillStyle = PALETTE.playerFace;
-    context.beginPath();
-    context.arc(4, 0, 5, 0, Math.PI * 2);
-    context.fill();
-    context.restore();
-    if (hidden) text('HIDDEN', player.x, player.y - 24, 15, PALETTE.good, 'center');
-    else if (player.sneaking) text('sneaking', player.x, player.y - 24, 14, PALETTE.muted, 'center');
+  /** Night vignette: the gallery's corners fall into shadow around the playfield. */
+  function paintVignette() {
+    const shade = ctx.createRadialGradient(
+      FIELD.width / 2, FIELD.height / 2, FIELD.height * 0.42,
+      FIELD.width / 2, FIELD.height / 2, FIELD.height * 0.95,
+    );
+    shade.addColorStop(0, 'rgba(6, 8, 16, 0)');
+    shade.addColorStop(1, 'rgba(6, 8, 16, 0.42)');
+    ctx.fillStyle = shade;
+    ctx.fillRect(0, 0, FIELD.width, FIELD.height);
   }
 
-  function drawField(state) {
-    drawTiles(state);
-    drawExit(state);
-    drawSapphire(state);
-    for (const camera of state.cameras) drawCamera(camera);
-    for (const guard of state.guards) drawGuard(guard);
-    drawSmoke(state);
-    drawPlayer(state);
-    // Night vignette: darken the corners so the torchlight reads.
-    const vig = context.createRadialGradient(
+  /** Red edge glow while a guard's meter or the alarm is climbing. */
+  function paintDangerGlow(state) {
+    const heat = Math.max(state.maxAlert || 0, state.alarm.value / ALARM.max);
+    if (heat <= 0.05) return;
+    const alpha = Math.min(0.4, heat * 0.35);
+    const glow = ctx.createRadialGradient(
       FIELD.width / 2, FIELD.height / 2, FIELD.height * 0.35,
       FIELD.width / 2, FIELD.height / 2, FIELD.height * 0.85,
     );
-    vig.addColorStop(0, 'rgba(4, 6, 12, 0)');
-    vig.addColorStop(1, 'rgba(4, 6, 12, 0.5)');
-    context.fillStyle = vig;
-    context.fillRect(0, 0, FIELD.width, FIELD.height);
+    glow.addColorStop(0, 'rgba(255, 59, 48, 0)');
+    glow.addColorStop(1, `rgba(255, 59, 48, ${alpha})`);
+    ctx.fillStyle = glow;
+    ctx.fillRect(0, 0, FIELD.width, FIELD.height);
   }
 
-  /** The alarm meter: a bar that fills green to red as the museum notices the thief. */
-  function drawAlarm(state) {
-    const alarm = state.alarm.value;
-    const cx = FIELD.width / 2;
-    const cy = 30;
-    const width = 300;
-    const height = 16;
-    const color = alarm < ALARM.warning * 0.5 ? PALETTE.good : alarm < ALARM.warning ? PALETTE.warn : PALETTE.bad;
-    const flashing = alarm >= ALARM.warning && Math.floor(Date.now() / 300) % 2 === 0;
-    context.save();
-    text('ALARM', cx - width / 2 - 8, cy + 13, 15, flashing ? PALETTE.bad : PALETTE.muted, 'right');
-    context.fillStyle = 'rgba(255,255,255,0.14)';
-    context.fillRect(cx - width / 2, cy, width, height);
-    context.fillStyle = color;
-    context.fillRect(cx - width / 2, cy, (width * alarm) / ALARM.max, height);
-    context.strokeStyle = flashing ? PALETTE.bad : 'rgba(255,255,255,0.35)';
-    context.lineWidth = 1;
-    context.strokeRect(cx - width / 2, cy, width, height);
-    const label = alarm < 1 ? 'quiet' : alarm < ALARM.warning ? 'stirring' : 'LOCKDOWN IMMINENT';
-    text(label, cx + width / 2 + 8, cy + 13, 15, color, 'left');
-    context.restore();
-  }
-
-  function drawHud(state, screen) {
-    context.textBaseline = 'top';
-    const objective = state.sapphireTaken
-      ? 'Reach the roof door — unseen'
-      : 'Steal the Star Sapphire';
-    text(objective, 24, 18, 24, PALETTE.text, 'left');
-    text(levelLabel(state.levelName), FIELD.width - 24, 18, 24, PALETTE.text, 'right');
-    drawAlarm(state);
-    const mins = Math.floor(state.levelTime / 60);
-    const secs = Math.floor(state.levelTime % 60);
-    const timeText = `${mins}:${String(secs).padStart(2, '0')}`;
-    text(timeLabel(timeText), 24, 52, 20, PALETTE.muted, 'left');
-    text(scoreLabel(state.score), FIELD.width - 24, 52, 20, PALETTE.muted, 'right');
-    // Lives: small sapphire dots, top-left under the objective.
-    for (let life = 0; life < LIVES; life += 1) {
-      context.fillStyle = life < state.lives ? PALETTE.sapphire : 'rgba(255,255,255,0.14)';
-      context.beginPath();
-      context.arc(32 + life * (LIFE_SIZE + LIFE_GAP), 92, 7, 0, Math.PI * 2);
-      context.fill();
+  /** The alarm meter: a bar across the top that fills as the museum notices you. */
+  function paintAlarmBar(value) {
+    const w = 300;
+    const h = 14;
+    const x = (FIELD.width - w) / 2;
+    const y = 10;
+    const frac = value / ALARM.max;
+    ctx.fillStyle = 'rgba(0, 0, 0, 0.55)';
+    roundRect(ctx, x - 58, y - 3, w + 116, h + 6, 5);
+    ctx.fill();
+    ctx.fillStyle = PALETTE.muted;
+    ctx.font = `bold 11px ${FONT}`;
+    ctx.textAlign = 'right';
+    ctx.textBaseline = 'middle';
+    ctx.fillText('ALARM', x - 8, y + h / 2);
+    ctx.fillStyle = '#1c1c28';
+    roundRect(ctx, x, y, w, h, 4);
+    ctx.fill();
+    const fill = frac < 0.5 ? PALETTE.good : frac < 0.7 ? PALETTE.warn : PALETTE.bad;
+    if (frac > 0.01) {
+      ctx.fillStyle = fill;
+      roundRect(ctx, x, y, Math.max(6, w * frac), h, 4);
+      ctx.fill();
     }
-    // Smoke pellets left, under the lives.
-    text(smokeLabel(`${state.smokeLeft} left (E)`), 24, 108, 17, PALETTE.muted, 'left');
-    if (screen === SCREEN_PLAY && state.exitOpen) {
-      text('The roof door is open — go!', FIELD.width / 2, FIELD.height - 34, 22, PALETTE.exit, 'center');
+    ctx.strokeStyle = value >= ALARM.warning ? PALETTE.bad : PALETTE.panelEdge;
+    ctx.lineWidth = value >= ALARM.warning ? 2 : 1;
+    roundRect(ctx, x, y, w, h, 4);
+    ctx.stroke();
+    if (value >= ALARM.warning) {
+      ctx.fillStyle = PALETTE.bad;
+      ctx.font = `bold 11px ${FONT}`;
+      ctx.textAlign = 'left';
+      ctx.fillText('LOCKDOWN SOON', x + w + 8, y + h / 2);
+    } else if (value > 0) {
+      ctx.fillStyle = PALETTE.muted;
+      ctx.font = `11px ${FONT}`;
+      ctx.textAlign = 'left';
+      ctx.fillText('stirring', x + w + 8, y + h / 2);
     }
   }
 
-  function drawPanel(title, lines, prompt) {
-    const height = PANEL.top + lines.length * PANEL.line + PANEL.bottom;
-    const x = (FIELD.width - PANEL.width) / 2;
-    const y = (FIELD.height - height) / 2;
-    context.fillStyle = PALETTE.panel;
-    context.fillRect(x, y, PANEL.width, height);
-    context.strokeStyle = PALETTE.panelEdge;
-    context.lineWidth = 2;
-    context.strokeRect(x, y, PANEL.width, height);
-    context.textBaseline = 'alphabetic';
-    text(title, FIELD.width / 2, y + 78, 46, PALETTE.text, 'center');
-    for (let index = 0; index < lines.length; index += 1) {
-      text(lines[index], FIELD.width / 2, y + PANEL.top + index * PANEL.line, 21, PALETTE.muted, 'center');
+  /** Lives as small hoods, smoke pellets as dots, score and clock at the edges. */
+  function paintHud(state) {
+    ctx.fillStyle = 'rgba(0, 0, 0, 0.45)';
+    ctx.fillRect(0, 0, FIELD.width, 34);
+    // Room name, top left.
+    ctx.fillStyle = PALETTE.text;
+    ctx.font = `bold 14px ${FONT}`;
+    ctx.textAlign = 'left';
+    ctx.textBaseline = 'middle';
+    ctx.fillText(`${state.levelName}  ·  Room ${state.levelIndex + 1}/3`, 12, 17);
+    // Score and clock on one line, top right.
+    ctx.textAlign = 'right';
+    ctx.fillStyle = PALETTE.text;
+    ctx.fillText(`Score ${state.score}  ·  ${fmtTime(state.levelTime)}`, FIELD.width - 12, 17);
+    // Lives and smoke, bottom left.
+    ctx.textAlign = 'left';
+    ctx.font = `13px ${FONT}`;
+    ctx.fillStyle = PALETTE.text;
+    ctx.fillText('Lives', 12, FIELD.height - 16);
+    for (let i = 0; i < state.lives; i += 1) {
+      ctx.fillStyle = PALETTE.playerCloak;
+      ctx.beginPath();
+      ctx.arc(58 + i * 20, FIELD.height - 16, 6, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.fillStyle = PALETTE.playerFace;
+      ctx.beginPath();
+      ctx.arc(58 + i * 20, FIELD.height - 16, 2.5, 0, Math.PI * 2);
+      ctx.fill();
     }
-    text(prompt, FIELD.width / 2, y + height - 38, 23, PALETTE.sapphire, 'center');
+    ctx.fillStyle = PALETTE.text;
+    ctx.fillText('Smoke', 130, FIELD.height - 16);
+    for (let i = 0; i < state.smokeLeft; i += 1) {
+      ctx.fillStyle = PALETTE.smoke;
+      ctx.beginPath();
+      ctx.arc(178 + i * 16, FIELD.height - 16, 5, 0, Math.PI * 2);
+      ctx.fill();
+    }
+    // Ghost bonus still alive: a green tag at the bottom centre.
+    if (state.ghost && !state.sapphireTaken) {
+      ctx.fillStyle = PALETTE.good;
+      ctx.textAlign = 'center';
+      ctx.font = `bold 12px ${FONT}`;
+      ctx.fillText('GHOST — unseen so far', FIELD.width / 2, FIELD.height - 16);
+    }
+    // Objective hint, bottom right.
+    ctx.fillStyle = PALETTE.muted;
+    ctx.textAlign = 'right';
+    ctx.font = `13px ${FONT}`;
+    ctx.fillText(
+      state.sapphireTaken ? 'Reach the roof door — unseen' : 'Steal the Star Sapphire',
+      FIELD.width - 12,
+      FIELD.height - 16,
+    );
+    paintAlarmBar(state.alarm.value);
   }
 
-  const TITLE_LINES = [
-    'Steal the Star Sapphire from the museum at night,',
-    'then slip out through the roof door — unseen.',
-    'Guards patrol with torches. Cameras sweep red cones.',
-    'Every eye feeds the ALARM meter. At 100 the museum locks down.',
-    'Hide in the velvet alcoves. Sneak with Shift. Throw smoke with E.',
-    '',
-  ];
-  const PAUSED_LINES = ['The guards wait in the dark. The cameras keep sweeping.'];
-  const CLEAR_LINES = ['', ''];
-  const OVER_LINES = ['', ''];
-  const WIN_LINES = ['', ''];
+  /** A centred dark panel with a title and a few lines of text. */
+  function paintPanel(title, lines, accent) {
+    const w = 640;
+    const lineH = 26;
+    const h = 92 + lines.length * lineH;
+    const x = (FIELD.width - w) / 2;
+    const y = (FIELD.height - h) / 2;
+    ctx.fillStyle = 'rgba(6, 8, 16, 0.72)';
+    ctx.fillRect(0, 0, FIELD.width, FIELD.height);
+    ctx.fillStyle = PALETTE.panel;
+    roundRect(ctx, x, y, w, h, 10);
+    ctx.fill();
+    ctx.strokeStyle = PALETTE.panelEdge;
+    ctx.lineWidth = 2;
+    roundRect(ctx, x, y, w, h, 10);
+    ctx.stroke();
+    ctx.fillStyle = accent || PALETTE.text;
+    ctx.font = `bold 34px ${FONT}`;
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillText(title, FIELD.width / 2, y + 44);
+    ctx.fillStyle = PALETTE.muted;
+    ctx.font = `16px ${FONT}`;
+    lines.forEach((line, i) => {
+      ctx.fillText(line, FIELD.width / 2, y + 82 + i * lineH);
+    });
+  }
 
-  /** Paint one frame: the field, then the HUD or a panel for the screen the game is on. */
+  function paintTitle(state, best) {
+    paintPanel('THE GILDED GALLERY', [
+      'Steal the Star Sapphire from the museum at night,',
+      'then slip out through the roof door — unseen.',
+      'Guards patrol with torches. Cameras sweep red cones.',
+      'Every eye feeds the ALARM meter. At 100 the museum locks down.',
+      'Hide in the velvet alcoves. Sneak with Shift. Throw smoke with E.',
+      `Best ${best}`,
+      '',
+      'Press Space or click to begin the heist',
+    ]);
+  }
+
+  function paintPaused() {
+    paintPanel('PAUSED', [
+      'The guards wait. The cameras keep sweeping.',
+      '',
+      'Press P to keep stealing',
+    ]);
+  }
+
+  function paintClear(state) {
+    paintPanel('ROOM CLEAR', [
+      `${state.levelName} cleared — the roof door is open.`,
+      `Score ${state.score}`,
+      '',
+      'Press Space for the next room',
+    ], PALETTE.good);
+  }
+
+  function paintOver(state, best) {
+    const lockdown = state.caughtBy === 'lockdown';
+    paintPanel(lockdown ? 'LOCKDOWN!' : 'CAUGHT!', [
+      lockdown
+        ? 'The alarm hit 100 — the museum sealed shut.'
+        : 'A guard grabbed you in the dark.',
+      `Score ${state.score}   ·   Best ${best}`,
+      '',
+      'Press Space to try again',
+    ], PALETTE.bad);
+  }
+
+  function paintWin(state, best) {
+    paintPanel('THE STAR SAPPHIRE IS YOURS', [
+      'Three rooms, no cell — the perfect heist.',
+      `Score ${state.score}   ·   Best ${best}`,
+      '',
+      'Press Space to steal it all over again',
+    ], PALETTE.sapphire);
+  }
+
+  /** One frame: the room, the eyes, the thief, the HUD, then any panel. */
   function draw(state, screen, best) {
-    context.setTransform(1, 0, 0, 1, 0, 0);
-    context.fillStyle = PALETTE.backdrop;
-    context.fillRect(0, 0, canvas.width, canvas.height);
-    context.setTransform(view.scale, 0, 0, view.scale, view.x, view.y);
-    drawField(state);
-    if (screen === SCREEN_TITLE) {
-      TITLE_LINES[5] = bestLabel(best);
-      drawPanel('THE GILDED GALLERY', TITLE_LINES, 'Press Space or click to begin the heist');
-      return;
-    }
-    drawHud(state, screen);
-    if (screen === SCREEN_PAUSED) {
-      drawPanel('Paused', PAUSED_LINES, 'Press P to keep stealing');
-    } else if (screen === SCREEN_CLEAR) {
-      CLEAR_LINES[0] = `${state.levelName} cleared — Score ${state.score}`;
-      CLEAR_LINES[1] = state.ghost ? 'Ghost: never chased. +300' : 'Seen, but the sapphire is yours.';
-      drawPanel('Room clear', CLEAR_LINES, 'Press Space for the next room');
-    } else if (screen === SCREEN_OVER) {
-      OVER_LINES[0] = finalLabel(state.score);
-      OVER_LINES[1] = bestLabel(best);
-      const title = state.caughtBy === 'lockdown' ? 'LOCKDOWN — the museum sealed shut' : 'Caught in the torchlight';
-      drawPanel(title, OVER_LINES, 'Press Space to try again');
-    } else if (screen === SCREEN_WIN) {
-      WIN_LINES[0] = finalLabel(state.score);
-      WIN_LINES[1] = bestLabel(best);
-      drawPanel('The Star Sapphire is yours', WIN_LINES, 'Press Space to steal it all over again');
-    }
+    frame();
+    paintFloor(state.grid);
+    paintWalls(state.grid);
+    paintFurniture(state.grid);
+    paintExit(state.exit);
+    paintSapphire(state.sapphire);
+    for (const guard of state.guards) paintGuardCone(guard);
+    for (const camera of state.cameras) paintCameraCone(camera);
+    paintClouds(state.alarm.clouds);
+    for (const camera of state.cameras) paintCamera(camera);
+    for (const guard of state.guards) paintGuard(guard);
+    paintThief(state.player, state.grid);
+    paintVignette();
+    paintDangerGlow(state);
+    if (screen !== SCREEN_TITLE) paintHud(state);
+    if (screen === SCREEN_TITLE) paintTitle(state, best);
+    else if (screen === SCREEN_PAUSED) paintPaused();
+    else if (screen === SCREEN_CLEAR) paintClear(state);
+    else if (screen === SCREEN_OVER) paintOver(state, best);
+    else if (screen === SCREEN_WIN) paintWin(state, best);
+    ctx.restore();
   }
 
-  resize();
-  window.addEventListener('resize', resize);
   return { draw };
 }
